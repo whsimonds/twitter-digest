@@ -1,0 +1,45 @@
+name: Generate Twitter Digest
+
+on:
+  # Run daily at 6 AM Eastern (11:00 UTC)
+  # Using :00 instead of :30 since we're not on the hour
+  schedule:
+    - cron: '0 11 * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  generate-digest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Generate digest
+        env:
+          XAPIS_KEY: ${{ secrets.XAPIS_KEY }}
+          TWITTER_USERNAME: ${{ secrets.TWITTER_USERNAME }}
+          RESEND_KEY: ${{ secrets.RESEND_KEY }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          DIGEST_URL: ${{ secrets.DIGEST_URL }}
+          # Optional configuration overrides
+          INCLUDE_RETWEETS: ${{ vars.INCLUDE_RETWEETS || 'true' }}
+          INCLUDE_REPLIES: ${{ vars.INCLUDE_REPLIES || 'false' }}
+          HOURS_BACK: ${{ vars.HOURS_BACK || '24' }}
+        run: node index.js
+      
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add docs/
+          git diff --quiet && git diff --staged --quiet || git commit -m "📰 Update digest - $(date +'%Y-%m-%d %H:%M UTC')"
+          git push
