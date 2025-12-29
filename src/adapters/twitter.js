@@ -78,10 +78,61 @@ export async function getFollowing(restId) {
       cursor,
     });
     
-    const users = result?.data?.users || result?.users || [];
+    // Debug: always log the response structure on first page
+    if (page === 0) {
+      console.log('   [DEBUG] Response keys:', Object.keys(result || {}));
+      if (result?.result) {
+        console.log('   [DEBUG] result keys:', Object.keys(result.result));
+      }
+      // Show a snippet of the response
+      const snippet = JSON.stringify(result, null, 2);
+      console.log('   [DEBUG] Response snippet:', snippet.slice(0, 500) + (snippet.length > 500 ? '...' : ''));
+    }
+    
+    // Try multiple possible response structures
+    let users = [];
+    
+    // Structure 1: { data: { users: [...] } }
+    if (result?.data?.users) {
+      users = result.data.users;
+      if (page === 0) console.log('   [DEBUG] Found users in result.data.users');
+    }
+    // Structure 2: { users: [...] }
+    else if (result?.users) {
+      users = result.users;
+      if (page === 0) console.log('   [DEBUG] Found users in result.users');
+    }
+    // Structure 3: { result: { users: [...] } }
+    else if (result?.result?.users) {
+      users = result.result.users;
+      if (page === 0) console.log('   [DEBUG] Found users in result.result.users');
+    }
+    // Structure 4: Direct array of timeline instructions (like tweets endpoint)
+    else if (result?.result?.timeline?.instructions) {
+      if (page === 0) console.log('   [DEBUG] Found timeline instructions structure');
+      for (const instruction of result.result.timeline.instructions) {
+        if (instruction.entries) {
+          for (const entry of instruction.entries) {
+            const user = entry?.content?.itemContent?.user_results?.result;
+            if (user) {
+              users.push(user.legacy || user);
+            }
+          }
+        }
+      }
+    }
+    else {
+      if (page === 0) console.log('   [DEBUG] No recognized user structure found');
+    }
+    
+    // Log what we found on first page
+    if (page === 0) {
+      console.log(`   [DEBUG] First page found ${users.length} users`);
+    }
+    
     following.push(...users);
     
-    cursor = result?.data?.next_cursor || result?.next_cursor;
+    cursor = result?.data?.next_cursor || result?.next_cursor || result?.result?.timeline?.instructions?.[0]?.entries?.find(e => e.entryId?.includes('cursor-bottom'))?.content?.value;
     page++;
     
     if (page % 5 === 0) {
@@ -90,7 +141,7 @@ export async function getFollowing(restId) {
     
     await sleep(config.sources.twitter.rateLimit.delayMs);
     
-  } while (cursor && cursor !== '0' && cursor !== 0);
+  } while (cursor && cursor !== '0' && cursor !== 0 && page < 50); // Cap at 50 pages (1000 users max)
   
   console.log(`   ✓ Following ${following.length} accounts\n`);
   return following;
@@ -472,40 +523,70 @@ export async function fetchAllTweets(username) {
   }
   
   // PRODUCTION MODE
-  console.log(`🔍 Looking up @${username}...\n`);
   
-  // Step 1: Get your own rest_id (1 credit)
-  const myUser = await getUserByUsername(username);
+  // Check for explicit follow list first
+  const followList = process.env.FOLLOW_LIST;
+  let accountsToFetch = [];
   
-  if (!myUser || !myUser.rest_id) {
-    console.log(`❌ Could not find user @${username}`);
+  if (followList) {
+    // Use explicit list of accounts
+    accountsToFetch = followList.split(',').map(s => s.trim()).filter(Boolean);
+    console.log(`📋 Using explicit follow list: ${accountsToFetch.length} accounts\n`);
+  } else {
+    // Fetch from Twitter following list
+    console.log(`🔍 Looking up @${username}...\n`);
+    
+    // Step 1: Get your own rest_id (1 credit)
+    const myUser = await getUserByUsername(username);
+    
+    if (!myUser || !myUser.rest_id) {
+      console.log(`❌ Could not find user @${username}`);
+      return [];
+    }
+    
+    console.log(`   ✓ Found @${username} (rest_id: ${myUser.rest_id})\n`);
+    
+    await sleep(config.sources.twitter.rateLimit.delayMs);
+    
+    // Step 2: Get following list (uses rest_id)
+    const following = await getFollowing(myUser.rest_id);
+    
+    if (following.length === 0) {
+      console.log('No accounts found in following list.');
+      console.log('💡 Tip: Set FOLLOW_LIST secret with comma-separated usernames');
+      return [];
+    }
+    
+    // Extract usernames from following list
+    accountsToFetch = following.map(u => u.screen_name || u.legacy?.screen_name || u.username).filter(Boolean);
+  }
+  
+  if (accountsToFetch.length === 0) {
+    console.log('No accounts to fetch.');
     return [];
   }
   
-  console.log(`   ✓ Found @${username} (rest_id: ${myUser.rest_id})\n`);
-  
-  await sleep(config.sources.twitter.rateLimit.delayMs);
-  
-  // Step 2: Get following list (uses rest_id)
-  const following = await getFollowing(myUser.rest_id);
-  
-  if (following.length === 0) {
-    console.log('No accounts found in following list.');
-    return [];
-  }
-  
-  console.log(`🐦 Fetching tweets from ${following.length} accounts...\n`);
+  console.log(`🐦 Fetching tweets from ${accountsToFetch.length} accounts...\n`);
   
   const allTweets = [];
   const { delayMs } = config.sources.twitter.rateLimit;
   
-  for (let i = 0; i < following.length; i++) {
-    const user = following[i];
-    const displayName = user.screen_name || user.legacy?.screen_name || user.username;
+  for (let i = 0; i < accountsToFetch.length; i++) {
+    const screenName = accountsToFetch[i];
     
-    process.stdout.write(`   [${i + 1}/${following.length}] @${displayName}...`);
+    process.stdout.write(`   [${i + 1}/${accountsToFetch.length}] @${screenName}...`);
     
-    const { tweets, pageInfo } = await getUserTweets(user, maxPagesPerUser);
+    // Look up user to get rest_id
+    const userInfo = await getUserByUsername(screenName);
+    
+    if (!userInfo || !userInfo.rest_id) {
+      console.log(` not found`);
+      continue;
+    }
+    
+    await sleep(delayMs);
+    
+    const { tweets, pageInfo } = await getUserTweets(userInfo, maxPagesPerUser);
     allTweets.push(...tweets);
     
     const pageBreakdown = pageInfo.tweetsPerPage.join('+');
