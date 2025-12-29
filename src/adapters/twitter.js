@@ -78,61 +78,51 @@ export async function getFollowing(restId) {
       cursor,
     });
     
-    // Debug: always log the response structure on first page
-    if (page === 0) {
-      console.log('   [DEBUG] Response keys:', Object.keys(result || {}));
-      if (result?.result) {
-        console.log('   [DEBUG] result keys:', Object.keys(result.result));
-      }
-      // Show a snippet of the response
-      const snippet = JSON.stringify(result, null, 2);
-      console.log('   [DEBUG] Response snippet:', snippet.slice(0, 500) + (snippet.length > 500 ? '...' : ''));
-    }
-    
     // Try multiple possible response structures
     let users = [];
     
     // Structure 1: { data: { users: [...] } }
     if (result?.data?.users) {
       users = result.data.users;
-      if (page === 0) console.log('   [DEBUG] Found users in result.data.users');
     }
     // Structure 2: { users: [...] }
     else if (result?.users) {
       users = result.users;
-      if (page === 0) console.log('   [DEBUG] Found users in result.users');
     }
     // Structure 3: { result: { users: [...] } }
     else if (result?.result?.users) {
       users = result.result.users;
-      if (page === 0) console.log('   [DEBUG] Found users in result.result.users');
     }
     // Structure 4: Direct array of timeline instructions (like tweets endpoint)
     else if (result?.result?.timeline?.instructions) {
-      if (page === 0) console.log('   [DEBUG] Found timeline instructions structure');
       for (const instruction of result.result.timeline.instructions) {
         if (instruction.entries) {
           for (const entry of instruction.entries) {
-            const user = entry?.content?.itemContent?.user_results?.result;
-            if (user) {
-              users.push(user.legacy || user);
+            // Skip cursor entries
+            if (entry.entryId?.includes('cursor')) continue;
+            
+            const userResult = entry?.content?.itemContent?.user_results?.result;
+            if (userResult) {
+              // Keep the full structure - we'll extract screen_name later
+              users.push(userResult);
             }
           }
         }
       }
     }
-    else {
-      if (page === 0) console.log('   [DEBUG] No recognized user structure found');
-    }
-    
-    // Log what we found on first page
-    if (page === 0) {
-      console.log(`   [DEBUG] First page found ${users.length} users`);
-    }
     
     following.push(...users);
     
-    cursor = result?.data?.next_cursor || result?.next_cursor || result?.result?.timeline?.instructions?.[0]?.entries?.find(e => e.entryId?.includes('cursor-bottom'))?.content?.value;
+    // Stop if no users found on this page (we've exhausted the list)
+    if (users.length === 0) {
+      break;
+    }
+    
+    // Extract cursor from multiple possible locations
+    cursor = result?.cursor?.bottom ||
+             result?.data?.next_cursor || 
+             result?.next_cursor;
+    
     page++;
     
     if (page % 5 === 0) {
@@ -141,7 +131,7 @@ export async function getFollowing(restId) {
     
     await sleep(config.sources.twitter.rateLimit.delayMs);
     
-  } while (cursor && cursor !== '0' && cursor !== 0 && page < 50); // Cap at 50 pages (1000 users max)
+  } while (cursor && cursor !== '0' && cursor !== 0 && page < 50);
   
   console.log(`   ✓ Following ${following.length} accounts\n`);
   return following;
@@ -191,7 +181,9 @@ function extractTweetFromEntry(entry, defaultUsername) {
       || userResult?.core?.name 
       || username;
     const profileImage = userLegacy?.profile_image_url_https 
-      || userResult?.profile_image_url_https;
+      || userResult?.avatar?.image_url
+      || userResult?.profile_image_url_https
+      || 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
     
     // Parse the date
     const createdAt = new Date(legacy.created_at);
@@ -223,6 +215,7 @@ function extractTweetFromEntry(entry, defaultUsername) {
         || qtUsername;
       
       const qtProfileImage = qtUserLegacy?.profile_image_url_https 
+        || qtUserResult?.avatar?.image_url
         || qtUserResult?.core?.profile_image_url_https
         || qtUserResult?.profile_image_url_https
         || 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
@@ -558,7 +551,18 @@ export async function fetchAllTweets(username) {
     }
     
     // Extract usernames from following list
-    accountsToFetch = following.map(u => u.screen_name || u.legacy?.screen_name || u.username).filter(Boolean);
+    accountsToFetch = following.map(u => {
+      // screen_name is in core.screen_name based on API response
+      return u.core?.screen_name || 
+             u.legacy?.screen_name || 
+             u.screen_name || 
+             u.username;
+    }).filter(Boolean);
+    
+    console.log(`   Extracted ${accountsToFetch.length} usernames`);
+    if (accountsToFetch.length > 0) {
+      console.log(`   First few: ${accountsToFetch.slice(0, 5).join(', ')}`);
+    }
   }
   
   if (accountsToFetch.length === 0) {
@@ -566,10 +570,17 @@ export async function fetchAllTweets(username) {
     return [];
   }
   
+  // Limit to N accounts WITH tweets if MAX_ACCOUNTS is set
+  const maxAccountsWithTweets = process.env.MAX_ACCOUNTS ? parseInt(process.env.MAX_ACCOUNTS) : null;
+  if (maxAccountsWithTweets) {
+    console.log(`⚠️ Will stop after ${maxAccountsWithTweets} accounts with tweets (MAX_ACCOUNTS set)`);
+  }
+  
   console.log(`🐦 Fetching tweets from ${accountsToFetch.length} accounts...\n`);
   
   const allTweets = [];
   const { delayMs } = config.sources.twitter.rateLimit;
+  let accountsWithTweets = 0;
   
   for (let i = 0; i < accountsToFetch.length; i++) {
     const screenName = accountsToFetch[i];
@@ -592,13 +603,22 @@ export async function fetchAllTweets(username) {
     const pageBreakdown = pageInfo.tweetsPerPage.join('+');
     console.log(` ${tweets.length} tweets (${pageInfo.pagesUsed} pages: ${pageBreakdown})`);
     
+    // Count accounts that actually have tweets
+    if (tweets.length > 0) {
+      accountsWithTweets++;
+      if (maxAccountsWithTweets && accountsWithTweets >= maxAccountsWithTweets) {
+        console.log(`\n   ⏹️ Stopping: reached ${maxAccountsWithTweets} accounts with tweets`);
+        break;
+      }
+    }
+    
     await sleep(delayMs);
   }
   
   // Sort by timestamp (newest first)
   allTweets.sort((a, b) => b.timestamp - a.timestamp);
   
-  console.log(`\n✓ Total: ${allTweets.length} tweets in the last ${config.sources.twitter.options.hoursBack} hours\n`);
+  console.log(`\n✓ Total: ${allTweets.length} tweets from ${accountsWithTweets} accounts in the last ${config.sources.twitter.options.hoursBack} hours\n`);
   
   return allTweets;
 }

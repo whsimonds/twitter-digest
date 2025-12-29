@@ -1020,7 +1020,8 @@ function formatDuration(ms) {
 function formatTweetText(text) {
   if (!text) return '';
   
-  let formatted = escapeHtml(text);
+  // First decode HTML entities from Twitter API, then escape for safe display
+  let formatted = escapeHtml(decodeHtmlEntities(text));
   
   // Convert URLs to links
   formatted = formatted.replace(
@@ -1044,6 +1045,26 @@ function formatTweetText(text) {
 }
 
 /**
+ * Decode HTML entities from Twitter API
+ * Twitter sometimes double-encodes, so we decode &amp; first
+ */
+function decodeHtmlEntities(text) {
+  if (!text) return '';
+  // First pass: decode &amp; to & (handles double-encoding)
+  let decoded = text.replace(/&amp;/g, '&');
+  // Second pass: decode all other entities
+  decoded = decoded
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
+  return decoded;
+}
+
+/**
  * Escape HTML entities
  */
 function escapeHtml(text) {
@@ -1052,6 +1073,6 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/"/g, '&quot;');
+    // Note: apostrophes don't need escaping in HTML content
 }
