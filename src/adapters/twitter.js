@@ -1,8 +1,12 @@
 /**
  * Twitter Adapter
  * 
- * Fetches data from Twitter via xAPIs (or other providers).
- * Handles pagination, rate limiting, and data normalization.
+ * Fetches data from Twitter via xAPIs.dev
+ * 
+ * Endpoints used:
+ * - /user?username=X         → Get user info including rest_id
+ * - /followings?user=ID      → Get accounts a user follows
+ * - /user-tweets?user=ID     → Get tweets from a user
  */
 
 import config from '../../config/config.js';
@@ -13,8 +17,8 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
  * Make authenticated request to xAPIs
  */
 async function xapisRequest(endpoint, params = {}) {
-  const { endpoints, sources } = config;
-  const url = new URL(`${endpoints.xapis.base}${endpoint}`);
+  const { sources } = config;
+  const url = new URL(`https://xapis.dev/api/v1/twitter${endpoint}`);
   
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== null) {
@@ -38,26 +42,46 @@ async function xapisRequest(endpoint, params = {}) {
 }
 
 /**
- * Get list of accounts the user follows
+ * Get user info by username (to get rest_id)
+ * Endpoint: /user?username=elonmusk
  */
-export async function getFollowing(username) {
-  console.log(`📋 Fetching following list for @${username}...`);
+export async function getUserByUsername(username) {
+  try {
+    const result = await xapisRequest('/user', {
+      username: username,
+    });
+    
+    // rest_id is at response.result.data.user.result.rest_id
+    const userData = result?.result?.data?.user?.result || result?.data || result;
+    return userData;
+  } catch (error) {
+    console.error(`   ⚠ Error looking up @${username}: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Get list of accounts the user follows
+ * Endpoint: /followings?user=44196397
+ */
+export async function getFollowing(restId) {
+  console.log(`📋 Fetching following list...`);
   
   const following = [];
   let cursor = undefined;
   let page = 0;
   
   do {
-    const result = await xapisRequest(config.endpoints.xapis.following, {
-      username,
+    const result = await xapisRequest('/followings', {
+      user: restId,
+      count: 20,
       cursor,
     });
     
-    if (result.data?.users) {
-      following.push(...result.data.users);
-    }
+    const users = result?.data?.users || result?.users || [];
+    following.push(...users);
     
-    cursor = result.data?.next_cursor;
+    cursor = result?.data?.next_cursor || result?.next_cursor;
     page++;
     
     if (page % 5 === 0) {
@@ -73,145 +97,173 @@ export async function getFollowing(username) {
 }
 
 /**
- * Get recent tweets from a user
+ * Extract a tweet from a timeline entry
+ * Handles the deeply nested xAPIs response structure
  */
-export async function getUserTweets(user) {
-  const username = user.screen_name || user.username;
-  const userId = user.id_str || user.id;
-  const { options } = config.sources.twitter;
-  
+function extractTweetFromEntry(entry, defaultUsername) {
   try {
-    const result = await xapisRequest(config.endpoints.xapis.tweets, {
-      username,
-      count: options.maxTweetsPerUser,
-    });
+    // Skip non-tweet entries (cursors, who-to-follow, promoted tweets)
+    if (!entry.entryId?.startsWith('tweet-')) return null;
+    if (entry.entryId?.includes('promoted')) return null;
     
-    if (!result.data?.tweets) {
-      return [];
+    const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
+    if (!tweetResult) return null;
+    
+    // Handle TweetWithVisibilityResults wrapper
+    const tweet = tweetResult.__typename === 'TweetWithVisibilityResults' 
+      ? tweetResult.tweet 
+      : tweetResult;
+    
+    if (!tweet?.legacy) return null;
+    
+    const legacy = tweet.legacy;
+    
+    // Get full text - check note_tweet for longer tweets first
+    let fullText = legacy.full_text || '';
+    if (tweet.note_tweet?.note_tweet_results?.result?.text) {
+      fullText = tweet.note_tweet.note_tweet_results.result.text;
     }
     
-    const cutoffTime = Date.now() - (options.hoursBack * 60 * 60 * 1000);
+    // Skip retweets (they start with "RT @")
+    if (fullText.startsWith('RT @')) return null;
     
-    return result.data.tweets
-      .filter(tweet => {
-        const tweetTime = new Date(tweet.created_at).getTime();
-        return tweetTime > cutoffTime;
-      })
-      .map(tweet => normalizeTweet(tweet, user));
+    // Get user info - try multiple paths
+    const userResult = tweet.core?.user_results?.result;
+    const userLegacy = userResult?.legacy;
+    
+    // Username can be in different places
+    const username = userLegacy?.screen_name 
+      || userResult?.core?.screen_name 
+      || defaultUsername 
+      || 'unknown';
+    const displayName = userLegacy?.name 
+      || userResult?.core?.name 
+      || username;
+    const profileImage = userLegacy?.profile_image_url_https 
+      || userResult?.profile_image_url_https;
+    
+    // Parse the date
+    const createdAt = new Date(legacy.created_at);
+    
+    // Extract quoted tweet if present
+    let quotedTweet = null;
+    const quotedResult = tweet.quoted_status_result?.result;
+    if (quotedResult) {
+      // Handle TweetWithVisibilityResults wrapper
+      const qtTweet = quotedResult.__typename === 'TweetWithVisibilityResults' 
+        ? quotedResult.tweet 
+        : quotedResult;
       
+      const qtLegacy = qtTweet?.legacy;
+      
+      // Try multiple paths for quote tweet user
+      const qtUserResult = qtTweet?.core?.user_results?.result;
+      const qtUserLegacy = qtUserResult?.legacy;
+      
+      // Extract username with fallbacks
+      const qtUsername = qtUserLegacy?.screen_name 
+        || qtUserResult?.core?.screen_name
+        || qtUserResult?.screen_name
+        || 'unknown';
+      
+      const qtDisplayName = qtUserLegacy?.name 
+        || qtUserResult?.core?.name
+        || qtUserResult?.name
+        || qtUsername;
+      
+      const qtProfileImage = qtUserLegacy?.profile_image_url_https 
+        || qtUserResult?.core?.profile_image_url_https
+        || qtUserResult?.profile_image_url_https
+        || 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
+      
+      if (qtLegacy) {
+        quotedTweet = {
+          id: qtLegacy.id_str,
+          text: qtLegacy.full_text || '',
+          author: {
+            username: qtUsername,
+            displayName: qtDisplayName,
+            profileImage: qtProfileImage,
+            verified: qtUserResult?.is_blue_verified || false,
+          },
+          media: extractMedia(qtLegacy),
+          url: `https://twitter.com/${qtUsername}/status/${qtLegacy.id_str}`,
+        };
+      }
+    }
+    
+    return {
+      id: legacy.id_str,
+      text: fullText,
+      createdAt: createdAt.toISOString(),
+      timestamp: createdAt.getTime(),
+      
+      author: {
+        id: userResult?.rest_id || legacy.user_id_str,
+        username: username,
+        displayName: displayName,
+        profileImage: profileImage,
+        verified: userResult?.is_blue_verified || false,
+      },
+      
+      conversationId: legacy.conversation_id_str || legacy.id_str,
+      inReplyToUserId: legacy.in_reply_to_user_id_str,
+      inReplyToTweetId: legacy.in_reply_to_status_id_str,
+      
+      isRetweet: false,
+      retweetedTweet: null,
+      
+      isQuote: legacy.is_quote_status || !!quotedTweet,
+      quotedTweet: quotedTweet,
+      
+      media: extractMedia(legacy),
+      
+      metrics: {
+        likes: legacy.favorite_count || 0,
+        retweets: legacy.retweet_count || 0,
+        replies: legacy.reply_count || 0,
+        quotes: legacy.quote_count || 0,
+        views: parseInt(tweet.views?.count || '0'),
+      },
+      
+      url: `https://twitter.com/${username}/status/${legacy.id_str}`,
+    };
   } catch (error) {
-    console.error(`   ⚠ Error fetching @${username}: ${error.message}`);
-    return [];
+    console.error('Error extracting tweet:', error.message);
+    return null;
   }
 }
 
 /**
- * Normalize tweet data into consistent format
+ * Extract media from tweet legacy object
  */
-function normalizeTweet(tweet, author) {
-  const normalized = {
-    id: tweet.id_str || tweet.id,
-    text: tweet.full_text || tweet.text || '',
-    createdAt: new Date(tweet.created_at).toISOString(),
-    timestamp: new Date(tweet.created_at).getTime(),
-    
-    author: {
-      id: author.id_str || author.id,
-      username: author.screen_name || author.username,
-      displayName: author.name || author.display_name,
-      profileImage: author.profile_image_url_https || author.profile_image_url,
-      verified: author.verified || author.is_blue_verified || false,
-    },
-    
-    // Thread detection fields
-    conversationId: tweet.conversation_id_str || tweet.conversation_id || tweet.id_str || tweet.id,
-    inReplyToUserId: tweet.in_reply_to_user_id_str || tweet.in_reply_to_user_id,
-    inReplyToTweetId: tweet.in_reply_to_status_id_str || tweet.in_reply_to_status_id,
-    
-    // Retweet detection
-    isRetweet: !!tweet.retweeted_status || tweet.text?.startsWith('RT @'),
-    retweetedTweet: tweet.retweeted_status ? normalizeRetweetedStatus(tweet.retweeted_status) : null,
-    
-    // Quote tweet detection
-    isQuote: !!tweet.quoted_status || !!tweet.is_quote_status,
-    quotedTweet: tweet.quoted_status ? normalizeRetweetedStatus(tweet.quoted_status) : null,
-    
-    // Media
-    media: extractMedia(tweet),
-    
-    // Metrics (optional display)
-    metrics: {
-      likes: tweet.favorite_count || 0,
-      retweets: tweet.retweet_count || 0,
-      replies: tweet.reply_count || 0,
-      quotes: tweet.quote_count || 0,
-    },
-    
-    // URLs for linking
-    url: `https://twitter.com/${author.screen_name || author.username}/status/${tweet.id_str || tweet.id}`,
-  };
-  
-  return normalized;
-}
-
-/**
- * Normalize a retweeted/quoted status
- */
-function normalizeRetweetedStatus(status) {
-  if (!status) return null;
-  
-  const user = status.user || {};
-  
-  return {
-    id: status.id_str || status.id,
-    text: status.full_text || status.text || '',
-    createdAt: status.created_at ? new Date(status.created_at).toISOString() : null,
-    author: {
-      id: user.id_str || user.id,
-      username: user.screen_name || user.username,
-      displayName: user.name,
-      profileImage: user.profile_image_url_https || user.profile_image_url,
-      verified: user.verified || user.is_blue_verified || false,
-    },
-    media: extractMedia(status),
-    url: `https://twitter.com/${user.screen_name || user.username}/status/${status.id_str || status.id}`,
-  };
-}
-
-/**
- * Extract media from tweet
- */
-function extractMedia(tweet) {
+function extractMedia(legacy) {
   const media = [];
-  
-  // Check extended_entities first (preferred), then entities
-  const mediaEntities = tweet.extended_entities?.media || tweet.entities?.media || [];
+  const mediaEntities = legacy.extended_entities?.media || legacy.entities?.media || [];
   
   for (const item of mediaEntities) {
     if (item.type === 'photo') {
       media.push({
         type: 'image',
         url: item.media_url_https || item.media_url,
-        width: item.sizes?.large?.w || item.original_info?.width,
-        height: item.sizes?.large?.h || item.original_info?.height,
+        width: item.sizes?.large?.w,
+        height: item.sizes?.large?.h,
         alt: item.ext_alt_text || '',
       });
     } else if (item.type === 'video' || item.type === 'animated_gif') {
-      // Find best quality MP4
       const variants = item.video_info?.variants || [];
       const mp4Variants = variants
         .filter(v => v.content_type === 'video/mp4')
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
       
       const bestVariant = mp4Variants[0];
-      
       if (bestVariant) {
         media.push({
           type: item.type === 'animated_gif' ? 'gif' : 'video',
           url: bestVariant.url,
-          thumbnailUrl: item.media_url_https || item.media_url,
-          width: item.video_info?.aspect_ratio?.[0] * 100 || item.sizes?.large?.w,
-          height: item.video_info?.aspect_ratio?.[1] * 100 || item.sizes?.large?.h,
+          thumbnailUrl: item.media_url_https,
+          width: item.sizes?.large?.w,
+          height: item.sizes?.large?.h,
           duration: item.video_info?.duration_millis,
         });
       }
@@ -222,36 +274,189 @@ function extractMedia(tweet) {
 }
 
 /**
+ * Get recent tweets from a user by rest_id
+ * Endpoint: /user-tweets?user=44196397
+ * 
+ * Response structure:
+ * result.timeline.instructions[].entries[].content.itemContent.tweet_results.result
+ * 
+ * Supports pagination via cursor parameter
+ */
+export async function getUserTweets(user, maxPages = 3) {
+  const username = user.screen_name || user.username || user.legacy?.screen_name;
+  const restId = user.rest_id || user.id_str || user.id;
+  const { options } = config.sources.twitter;
+  
+  if (!restId) {
+    console.error(`   ⚠ No rest_id for @${username}`);
+    return [];
+  }
+  
+  const allTweets = [];
+  let cursor = null;
+  let pageCount = 0;
+  const cutoffTime = Date.now() - (options.hoursBack * 60 * 60 * 1000);
+  let reachedCutoff = false;
+  const pageCounts = []; // Track tweets per page
+  
+  try {
+    while (pageCount < maxPages && !reachedCutoff) {
+      pageCount++;
+      
+      const params = {
+        user: restId,
+        count: options.maxTweetsPerUser,
+      };
+      
+      if (cursor) {
+        params.cursor = cursor;
+      }
+      
+      const result = await xapisRequest('/user-tweets', params);
+      
+      // Navigate the deeply nested structure
+      const instructions = result?.result?.timeline?.instructions || [];
+      let pageTweets = 0;
+      let nextCursor = null;
+      
+      for (const instruction of instructions) {
+        // Handle TimelineAddEntries
+        if (instruction.type === 'TimelineAddEntries' && instruction.entries) {
+          for (const entry of instruction.entries) {
+            // Check for cursor entry
+            if (entry.entryId?.startsWith('cursor-bottom')) {
+              nextCursor = entry.content?.value;
+              continue;
+            }
+            
+            const tweet = extractTweetFromEntry(entry, username);
+            if (tweet) {
+              // Check if we've gone past our time window
+              if (tweet.timestamp < cutoffTime) {
+                reachedCutoff = true;
+                continue;
+              }
+              allTweets.push(tweet);
+              pageTweets++;
+            }
+          }
+        }
+        
+        // Handle TimelinePinEntry (pinned tweet)
+        if (instruction.type === 'TimelinePinEntry' && instruction.entry) {
+          const tweet = extractTweetFromEntry(instruction.entry, username);
+          if (tweet && tweet.timestamp > cutoffTime) {
+            allTweets.push(tweet);
+            pageTweets++;
+          }
+        }
+      }
+      
+      pageCounts.push(pageTweets);
+      
+      // Update cursor for next page
+      cursor = nextCursor;
+      
+      // Stop if no cursor or no new tweets found
+      if (!cursor || pageTweets === 0) {
+        break;
+      }
+      
+      // Small delay between pagination requests
+      if (pageCount < maxPages && cursor && !reachedCutoff) {
+        await sleep(config.sources.twitter.rateLimit.delayMs);
+      }
+    }
+    
+    // Deduplicate tweets by ID
+    const uniqueTweets = Array.from(
+      new Map(allTweets.map(t => [t.id, t])).values()
+    );
+    
+    // Return tweets and page info
+    return { 
+      tweets: uniqueTweets, 
+      pageInfo: {
+        pagesUsed: pageCount,
+        tweetsPerPage: pageCounts,
+        reachedCutoff,
+        hasMore: !!cursor && !reachedCutoff,
+      }
+    };
+      
+  } catch (error) {
+    console.error(`   ⚠ Error fetching @${username}: ${error.message}`);
+    return { 
+      tweets: allTweets, 
+      pageInfo: { pagesUsed: pageCount, tweetsPerPage: pageCounts, error: error.message }
+    };
+  }
+}
+
+/**
  * Fetch all tweets from all followed accounts
  */
 export async function fetchAllTweets(username) {
   const { testMode } = config;
+  const { maxPagesPerUser } = config.sources.twitter.options;
   
   // TEST MODE: Skip following list, use test accounts
   if (testMode.enabled) {
     console.log('🧪 TEST MODE ENABLED');
     console.log(`   Max credits: ${testMode.maxCredits}`);
-    console.log(`   Test accounts: ${testMode.testAccounts.join(', ')}\n`);
+    console.log(`   Test accounts: ${testMode.testAccounts.join(', ')}`);
+    console.log(`   Max pages per user: ${maxPagesPerUser}\n`);
     
-    // Limit to maxCredits accounts (1 credit each)
-    const accountsToFetch = testMode.testAccounts.slice(0, testMode.maxCredits);
+    // Credits per account: 1 for /user lookup + maxPagesPerUser for /user-tweets pages
+    const creditsPerAccount = 1 + maxPagesPerUser;
+    const maxAccounts = Math.floor(testMode.maxCredits / creditsPerAccount);
     
-    console.log(`🐦 Fetching tweets from ${accountsToFetch.length} test accounts...\n`);
+    if (maxAccounts < 1) {
+      console.log(`⚠ Need at least ${creditsPerAccount} credits per account (1 lookup + ${maxPagesPerUser} pages)`);
+      console.log(`  Set TEST_MAX_CREDITS=${creditsPerAccount} or higher\n`);
+      return [];
+    }
+    
+    const accountsToFetch = testMode.testAccounts.slice(0, maxAccounts);
+    
+    console.log(`🐦 Fetching tweets from ${accountsToFetch.length} test accounts...`);
+    console.log(`   (up to ${creditsPerAccount} credits per account: 1 lookup + ${maxPagesPerUser} pages)\n`);
     
     const allTweets = [];
     const { delayMs } = config.sources.twitter.rateLimit;
+    let creditsUsed = 0;
     
     for (let i = 0; i < accountsToFetch.length; i++) {
-      const username = accountsToFetch[i];
+      const screenName = accountsToFetch[i];
       
-      process.stdout.write(`   [${i + 1}/${accountsToFetch.length}] @${username}...`);
+      console.log(`   [${i + 1}/${accountsToFetch.length}] @${screenName}:`);
       
-      // Create a minimal user object for the adapter
-      const user = { screen_name: username, username: username };
-      const tweets = await getUserTweets(user);
+      // Step 1: Look up user to get rest_id (1 credit)
+      const userInfo = await getUserByUsername(screenName);
+      creditsUsed++;
+      
+      if (!userInfo || !userInfo.rest_id) {
+        console.log(`      ⚠ User not found (1 credit used)`);
+        continue;
+      }
+      
+      await sleep(delayMs);
+      
+      // Step 2: Get their tweets using rest_id (1 credit per page)
+      const { tweets, pageInfo } = await getUserTweets(userInfo, maxPagesPerUser);
+      creditsUsed += pageInfo.pagesUsed;
+      
       allTweets.push(...tweets);
       
-      console.log(` ${tweets.length} tweets (1 credit used)`);
+      // Display per-page breakdown
+      const pageBreakdown = pageInfo.tweetsPerPage.map((count, idx) => `p${idx + 1}:${count}`).join(', ');
+      console.log(`      📄 ${pageInfo.pagesUsed} page(s): [${pageBreakdown}] = ${tweets.length} tweets`);
+      if (pageInfo.reachedCutoff) {
+        console.log(`      ⏱ Stopped: reached ${config.sources.twitter.options.hoursBack}h cutoff`);
+      } else if (pageInfo.hasMore) {
+        console.log(`      📌 More tweets available (increase MAX_PAGES_PER_USER to fetch)`);
+      }
+      console.log(`      💳 Credits: ${1 + pageInfo.pagesUsed} (1 lookup + ${pageInfo.pagesUsed} pages)`);
       
       if (i < accountsToFetch.length - 1) {
         await sleep(delayMs);
@@ -261,13 +466,28 @@ export async function fetchAllTweets(username) {
     allTweets.sort((a, b) => b.timestamp - a.timestamp);
     
     console.log(`\n✓ Test complete: ${allTweets.length} tweets fetched`);
-    console.log(`✓ Credits used: ${accountsToFetch.length}\n`);
+    console.log(`✓ Credits used: ${creditsUsed}\n`);
     
     return allTweets;
   }
   
-  // PRODUCTION MODE: Fetch full following list
-  const following = await getFollowing(username);
+  // PRODUCTION MODE
+  console.log(`🔍 Looking up @${username}...\n`);
+  
+  // Step 1: Get your own rest_id (1 credit)
+  const myUser = await getUserByUsername(username);
+  
+  if (!myUser || !myUser.rest_id) {
+    console.log(`❌ Could not find user @${username}`);
+    return [];
+  }
+  
+  console.log(`   ✓ Found @${username} (rest_id: ${myUser.rest_id})\n`);
+  
+  await sleep(config.sources.twitter.rateLimit.delayMs);
+  
+  // Step 2: Get following list (uses rest_id)
+  const following = await getFollowing(myUser.rest_id);
   
   if (following.length === 0) {
     console.log('No accounts found in following list.');
@@ -281,14 +501,15 @@ export async function fetchAllTweets(username) {
   
   for (let i = 0; i < following.length; i++) {
     const user = following[i];
-    const username = user.screen_name || user.username;
+    const displayName = user.screen_name || user.legacy?.screen_name || user.username;
     
-    process.stdout.write(`   [${i + 1}/${following.length}] @${username}...`);
+    process.stdout.write(`   [${i + 1}/${following.length}] @${displayName}...`);
     
-    const tweets = await getUserTweets(user);
+    const { tweets, pageInfo } = await getUserTweets(user, maxPagesPerUser);
     allTweets.push(...tweets);
     
-    console.log(` ${tweets.length} tweets`);
+    const pageBreakdown = pageInfo.tweetsPerPage.join('+');
+    console.log(` ${tweets.length} tweets (${pageInfo.pagesUsed} pages: ${pageBreakdown})`);
     
     await sleep(delayMs);
   }

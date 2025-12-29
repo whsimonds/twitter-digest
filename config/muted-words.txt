@@ -1,0 +1,83 @@
+# Muted Words Configuration
+# One word or phrase per line (case-insensitive)
+# Lines starting with # are comments
+# Blank lines are ignored
+
+# Politics - US
+Trump
+Biden
+Kamala
+Harris
+Pelosi
+AOC
+Sanders
+Warren
+Democrat
+Republican
+Election
+vote
+
+# Politics - International
+nato
+ukraine
+ukranian
+russia
+putin
+
+# Social Issues
+blm
+defund
+white supremacy
+confederate
+racism
+racist
+sexist
+ablist
+abortion
+trans
+gendered
+white male
+white males
+
+# Crypto/Web3
+web3
+nft
+blockchain
+defi
+bitcoin
+btc
+$GME
+GME
+Gamestop
+
+# Health/Covid
+covid
+covid19
+#covid19
+vaccine
+vaccination
+pandemic
+sarscov2
+masks
+infections
+infection
+
+# Violence
+shooter
+shooting
+killed
+injured
+protests
+riots
+riot
+
+# Climate
+fossil fuel
+climate
+
+# Celebrities
+Kardashian
+
+# Locations (optional - comment out if you want these)
+# san francisco
+# california

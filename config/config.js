@@ -5,6 +5,35 @@
  * This structure is designed to be extensible for future sources.
  */
 
+import { readFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Load muted words from file
+ */
+function loadMutedWords() {
+  const mutedWordsPath = process.env.MUTED_WORDS_FILE || join(__dirname, 'muted-words.txt');
+  
+  if (!existsSync(mutedWordsPath)) {
+    return [];
+  }
+  
+  try {
+    const content = readFileSync(mutedWordsPath, 'utf-8');
+    return content
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#')) // Remove empty lines and comments
+      .map(word => word.toLowerCase());
+  } catch (error) {
+    console.warn('Could not load muted words file:', error.message);
+    return [];
+  }
+}
+
 export default {
   // Test mode - limits API calls for credit conservation
   testMode: {
@@ -12,6 +41,20 @@ export default {
     maxCredits: parseInt(process.env.TEST_MAX_CREDITS || '3', 10),
     // In test mode, skip following list and use these accounts instead
     testAccounts: (process.env.TEST_ACCOUNTS || 'elonmusk,sama').split(',').map(s => s.trim()),
+  },
+  
+  // Content filtering
+  filtering: {
+    // Muted words - tweets containing these words will be hidden
+    mutedWords: {
+      enabled: process.env.REMOVE_MUTED_WORDS === 'true',
+      words: loadMutedWords(),
+    },
+    
+    // Video handling
+    videos: {
+      enabled: process.env.DISABLE_VIDEOS !== 'true', // Videos enabled by default
+    },
   },
   
   // Data sources (extensible for future platforms)
@@ -27,6 +70,7 @@ export default {
         includeReplies: process.env.INCLUDE_REPLIES === 'true',
         hoursBack: parseInt(process.env.HOURS_BACK || '24', 10),
         maxTweetsPerUser: parseInt(process.env.MAX_TWEETS_PER_USER || '50', 10),
+        maxPagesPerUser: parseInt(process.env.MAX_PAGES_PER_USER || '3', 10), // Each page = 1 credit
       },
       
       rateLimit: {
